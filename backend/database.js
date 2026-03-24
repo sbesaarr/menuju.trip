@@ -1,12 +1,23 @@
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
-require('dotenv').config({ path: require('path').resolve(__dirname, '.env') });
+
+// Load .env only in local dev (Vercel injects env vars directly)
+if (!process.env.VERCEL && !process.env.DATABASE_URL) {
+    require('dotenv').config({ path: require('path').resolve(__dirname, '.env') });
+}
+
+const dbUrl = process.env.DATABASE_URL;
+if (!dbUrl) {
+    console.error('FATAL: DATABASE_URL is not set!');
+    process.exit(1);
+}
 
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL
+    connectionString: dbUrl,
+    ssl: dbUrl.includes('neon.tech') || dbUrl.includes('sslmode') ? { rejectUnauthorized: false } : false
 });
 
-console.log('Connecting to PostgreSQL database...', process.env.DATABASE_URL.replace(/:([^:@]+)@/, ':**@'));
+console.log('Connecting to PostgreSQL...', dbUrl.replace(/:([^:@]+)@/, ':**@'));
 
 // Helper to convert SQLite `?` to PostgreSQL `$1, $2, ...`
 function convertQuery(query) {
