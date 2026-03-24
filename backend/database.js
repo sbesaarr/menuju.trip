@@ -1,120 +1,184 @@
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
+const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
+require('dotenv').config({ path: require('path').resolve(__dirname, '.env') });
 
-const dbPath = process.env.VERCEL ? '/tmp/database.sqlite' : path.resolve(__dirname, 'database.sqlite');
-const db = new sqlite3.Database(dbPath);
-
-console.log('Connecting to SQLite database...');
-
-db.serialize(() => {
-    // 1. Products Table
-    db.run(`CREATE TABLE IF NOT EXISTS products (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        type TEXT NOT NULL,
-        price REAL NOT NULL,
-        cost_price REAL NOT NULL
-    )`);
-
-    // 2. Guests Table
-    db.run(`CREATE TABLE IF NOT EXISTS guests (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        phone TEXT
-    )`);
-
-    // 3. Bookings Table
-    db.run(`CREATE TABLE IF NOT EXISTS bookings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        product_id INTEGER,
-        guest_id INTEGER,
-        trip_date TEXT NOT NULL,
-        pax INTEGER NOT NULL,
-        total_price REAL NOT NULL,
-        down_payment REAL DEFAULT 0,
-        status TEXT DEFAULT 'BELUM TRIP',
-        closing_by TEXT,
-        guest_type TEXT,
-        service_type TEXT,
-        service_category TEXT,
-        ship_type TEXT,
-        cabin_name TEXT,
-        ship_name TEXT,
-        operator_name TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (product_id) REFERENCES products(id),
-        FOREIGN KEY (guest_id) REFERENCES guests(id)
-    )`);
-
-    // 4. Booking Services Table
-    db.run(`CREATE TABLE IF NOT EXISTS booking_services (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        booking_id INTEGER,
-        product_id INTEGER,
-        qty INTEGER DEFAULT 1,
-        price REAL NOT NULL,
-        FOREIGN KEY (booking_id) REFERENCES bookings(id) ON DELETE CASCADE,
-        FOREIGN KEY (product_id) REFERENCES products(id)
-    )`);
-
-    // 5. Booking Payments Table
-    db.run(`CREATE TABLE IF NOT EXISTS booking_payments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        booking_id INTEGER,
-        payment_date TEXT NOT NULL,
-        amount REAL NOT NULL,
-        proof_url TEXT,
-        FOREIGN KEY (booking_id) REFERENCES bookings(id) ON DELETE CASCADE
-    )`);
-
-    // 6. Operator Payments Table
-    db.run(`CREATE TABLE IF NOT EXISTS operator_payments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        booking_id INTEGER,
-        payment_date TEXT NOT NULL,
-        amount REAL NOT NULL,
-        proof_url TEXT,
-        FOREIGN KEY (booking_id) REFERENCES bookings(id) ON DELETE CASCADE
-    )`);
-
-    // 7. Master Settings Tables
-    db.run(`CREATE TABLE IF NOT EXISTS master_ships (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, category_name TEXT)`);
-    db.run(`CREATE TABLE IF NOT EXISTS master_sales (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)`);
-    db.run(`CREATE TABLE IF NOT EXISTS master_services (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)`);
-    db.run(`CREATE TABLE IF NOT EXISTS master_categories (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)`);
-    db.run(`CREATE TABLE IF NOT EXISTS master_ship_types (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)`);
-
-    // 8. Users Table for Auth
-    db.run(`
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            role TEXT DEFAULT 'staff'
-        )
-    `, () => {
-        db.get("SELECT COUNT(*) as count FROM users", [], (err, row) => {
-            if (!err && row.count === 0) {
-                console.log('Seeding master admin user...');
-                const headpass = bcrypt.hashSync('admin123', 8);
-                db.run("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", ['admin', headpass, 'admin']);
-            }
-        });
-    });
-
-    // Insert some initial master data if empty
-    db.get("SELECT COUNT(*) as count FROM products", (err, row) => {
-        if (!err && row.count === 0) {
-            console.log('Seeding initial products data...');
-            const stmt = db.prepare("INSERT INTO products (name, type, price, cost_price) VALUES (?, ?, ?, ?)");
-            stmt.run("Open Trip Darat 3D2N", "Open Trip", 1500000, 1000000);
-            stmt.run("Sailing 1 Day Komodo", "Sailing Trip", 1200000, 800000);
-            stmt.run("Private Trip Darat 2D1N", "Private Trip", 2500000, 1800000);
-            stmt.run("Sewa Spesial Drone", "Layanan Tambahan", 1500000, 1000000);
-            stmt.finalize();
-        }
-    });
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL
 });
+
+console.log('Connecting to PostgreSQL database...', process.env.DATABASE_URL.replace(/:([^:@]+)@/, ':**@'));
+
+// Helper to convert SQLite `?` to PostgreSQL `$1, $2, ...`
+function convertQuery(query) {
+    let count = 1;
+    return query.replace(/\?/g, () => `$${count++}`);
+}
+
+const db = {
+    all: (sql, params, cb) => {
+        if (typeof params === 'function') { cb = params; params = []; }
+        pool.query(convertQuery(sql), params || [], (err, res) => {
+            if (cb) cb(err, res ? res.rows : []);
+        });
+    },
+    get: (sql, params, cb) => {
+        if (typeof params === 'function') { cb = params; params = []; }
+        pool.query(convertQuery(sql), params || [], (err, res) => {
+            if (cb) cb(err, res && res.rows.length > 0 ? res.rows[0] : null);
+        });
+    },
+    run: (sql, params, cb) => {
+        if (typeof params === 'function') { cb = params; params = []; }
+        
+        let q = convertQuery(sql);
+        const isInsert = q.trim().toUpperCase().startsWith('INSERT');
+        
+        if (isInsert && !q.toUpperCase().includes('RETURNING')) {
+            q += ' RETURNING id';
+        }
+
+        pool.query(q, params || [], (err, res) => {
+            const context = {
+                lastID: (isInsert && res && res.rows && res.rows.length > 0 && res.rows[0].id) ? res.rows[0].id : null,
+                changes: res ? res.rowCount : 0
+            };
+            if (err) {
+                // Adapt SQLite UNIQUE constraint error
+                if (err.code === '23505') {
+                    err.message = 'UNIQUE constraint failed';
+                }
+            }
+            if (cb) cb.call(context, err);
+        });
+    },
+    serialize: (cb) => {
+        cb();
+    },
+    prepare: (sql) => {
+        let promises = [];
+        return {
+            run: (...args) => {
+                let cb = null;
+                if (args.length > 0 && typeof args[args.length - 1] === 'function') {
+                    cb = args.pop();
+                }
+                const promise = new Promise((resolve) => {
+                    db.run(sql, args, function(err) {
+                        if (cb) cb.call(this, err);
+                        resolve();
+                    });
+                });
+                promises.push(promise);
+            },
+            finalize: (cb) => {
+                Promise.all(promises).then(() => {
+                    if (cb) cb();
+                });
+            }
+        };
+    }
+};
+
+// Initialize schema
+const initDB = async () => {
+    try {
+        await pool.query(`CREATE TABLE IF NOT EXISTS products (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            type VARCHAR(100) NOT NULL,
+            price REAL NOT NULL,
+            cost_price REAL NOT NULL
+        )`);
+
+        await pool.query(`CREATE TABLE IF NOT EXISTS guests (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            phone VARCHAR(50)
+        )`);
+
+        await pool.query(`CREATE TABLE IF NOT EXISTS bookings (
+            id SERIAL PRIMARY KEY,
+            product_id INTEGER REFERENCES products(id),
+            guest_id INTEGER REFERENCES guests(id),
+            trip_date VARCHAR(100) NOT NULL,
+            pax INTEGER NOT NULL,
+            total_price REAL NOT NULL,
+            down_payment REAL DEFAULT 0,
+            status VARCHAR(100) DEFAULT 'BELUM TRIP',
+            closing_by VARCHAR(255),
+            guest_type VARCHAR(100),
+            service_type VARCHAR(100),
+            service_category VARCHAR(100),
+            ship_type VARCHAR(100),
+            cabin_name VARCHAR(255),
+            ship_name VARCHAR(255),
+            operator_name VARCHAR(255),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+
+        await pool.query(`CREATE TABLE IF NOT EXISTS booking_services (
+            id SERIAL PRIMARY KEY,
+            booking_id INTEGER REFERENCES bookings(id) ON DELETE CASCADE,
+            product_id INTEGER REFERENCES products(id),
+            qty INTEGER DEFAULT 1,
+            price REAL NOT NULL
+        )`);
+
+        await pool.query(`CREATE TABLE IF NOT EXISTS booking_payments (
+            id SERIAL PRIMARY KEY,
+            booking_id INTEGER REFERENCES bookings(id) ON DELETE CASCADE,
+            payment_date VARCHAR(100) NOT NULL,
+            amount REAL NOT NULL,
+            proof_url TEXT
+        )`);
+
+        await pool.query(`CREATE TABLE IF NOT EXISTS operator_payments (
+            id SERIAL PRIMARY KEY,
+            booking_id INTEGER REFERENCES bookings(id) ON DELETE CASCADE,
+            payment_date VARCHAR(100) NOT NULL,
+            amount REAL NOT NULL,
+            proof_url TEXT
+        )`);
+
+        await pool.query(`CREATE TABLE IF NOT EXISTS master_ships (id SERIAL PRIMARY KEY, name VARCHAR(255) NOT NULL, category_name VARCHAR(255))`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS master_sales (id SERIAL PRIMARY KEY, name VARCHAR(255) NOT NULL)`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS master_services (id SERIAL PRIMARY KEY, name VARCHAR(255) NOT NULL)`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS master_categories (id SERIAL PRIMARY KEY, name VARCHAR(255) NOT NULL)`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS master_ship_types (id SERIAL PRIMARY KEY, name VARCHAR(255) NOT NULL)`);
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(255) UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                role VARCHAR(100) DEFAULT 'staff',
+                photo_url TEXT
+            )
+        `);
+
+        // Seed Admin user
+        const { rows: userRows } = await pool.query("SELECT COUNT(*) FROM users");
+        if (parseInt(userRows[0].count) === 0) {
+            console.log('Seeding master admin user...');
+            const headpass = bcrypt.hashSync('admin123', 8);
+            await pool.query("INSERT INTO users (username, password, role) VALUES ($1, $2, $3)", ['admin', headpass, 'admin']);
+        }
+
+        // Seed initial products
+        const { rows: prodRows } = await pool.query("SELECT COUNT(*) FROM products");
+        if (parseInt(prodRows[0].count) === 0) {
+            console.log('Seeding initial products data...');
+            await pool.query("INSERT INTO products (name, type, price, cost_price) VALUES ($1, $2, $3, $4)", ["Open Trip Darat 3D2N", "Open Trip", 1500000, 1000000]);
+            await pool.query("INSERT INTO products (name, type, price, cost_price) VALUES ($1, $2, $3, $4)", ["Sailing 1 Day Komodo", "Sailing Trip", 1200000, 800000]);
+            await pool.query("INSERT INTO products (name, type, price, cost_price) VALUES ($1, $2, $3, $4)", ["Private Trip Darat 2D1N", "Private Trip", 2500000, 1800000]);
+            await pool.query("INSERT INTO products (name, type, price, cost_price) VALUES ($1, $2, $3, $4)", ["Sewa Spesial Drone", "Layanan Tambahan", 1500000, 1000000]);
+        }
+
+    } catch (e) {
+        console.error('Error initializing PostgreSQL schema', e);
+    }
+};
+
+initDB();
 
 module.exports = db;
